@@ -1,0 +1,237 @@
+// ======================================================
+// MIXLOCK PLL COMPLETE DESIGN (ALL IN ONE FILE)
+// ======================================================
+
+// ===================== TOP MODULE =====================
+module mixlock_pll_top (
+    input clk,
+    input rst_n,
+    input chip_reset,
+    input scan_enable,
+    input [7:0] N_prog,
+    input f_ref,
+    output f_out,
+    output lock_detect,
+    output corrupt_flag,
+    output puf_ready
+);
+
+wire [15:0] K_puf;
+wire [15:0] active_key;
+wire [7:0] N_locked;
+wire f_div;
+
+// -------- PUF --------
+puf_top puf_inst (
+    .clk(clk),
+    .rst_n(rst_n),
+    .K_puf(K_puf),
+    .puf_ready(puf_ready)
+);
+
+// -------- DisORC --------
+disorc_key_manager disorc_inst (
+    .clk(clk),
+    .rst_n(rst_n & puf_ready),
+    .chip_reset(chip_reset),
+    .scan_enable(scan_enable),
+    .K_puf(K_puf),
+    .dummy_key(16'hDEAD),
+    .active_key(active_key),
+    .corrupt_flag(corrupt_flag)
+);
+
+// -------- TRLL --------
+trll_locked_divider trll_inst (
+    .N_prog(N_prog),
+    .active_key(active_key),
+    .K_puf(K_puf),
+    .N_locked(N_locked)
+);
+
+// -------- Divider (PLL feedback) --------
+divider_8bit div_inst (
+    .clk(clk),
+    .rst_n(rst_n),
+    .N_locked(N_locked),
+    .f_div(f_div)
+);
+
+// -------- PFD --------
+wire UP, DN;
+pfd pfd_inst (
+    .clk_ref(f_ref),
+    .clk_fb(f_div),
+    .rst_n(rst_n),
+    .UP(UP),
+    .DN(DN)
+);
+
+// -------- Simple PLL behavior --------
+assign f_out = f_div;
+assign lock_detect = (UP == 0 && DN == 0);
+
+endmodule
+
+// ===================== PUF =====================
+module puf_top (
+    input clk,
+    input rst_n,
+    output reg [15:0] K_puf,
+    output reg puf_ready
+);
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        K_puf <= 16'hA5A5; // Example fixed pattern
+        puf_ready <= 0;
+    end else begin
+        K_puf <= 16'hA5A5;
+        puf_ready <= 1;
+    end
+end
+
+endmodule
+
+// ===================== DisORC =====================
+module disorc_key_manager (
+    input clk,
+    input rst_n,
+    input chip_reset,
+    input scan_enable,
+    input [15:0] K_puf,
+    input [15:0] dummy_key,
+    output reg [15:0] active_key,
+    output reg corrupt_flag
+);
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)
+        corrupt_flag <= 0;
+    else if (chip_reset)
+        corrupt_flag <= 0;
+    else
+        corrupt_flag <= corrupt_flag | scan_enable; // sticky
+end
+
+always @(*) begin
+    active_key = (corrupt_flag) ? dummy_key : K_puf;
+end
+
+endmodule
+
+// ===================== TRLL =====================
+module trll_locked_divider (
+    input [7:0] N_prog,
+    input [15:0] active_key,
+    input [15:0] K_puf,
+    output [7:0] N_locked
+);
+
+wire [15:0] key_diff;
+
+assign key_diff = active_key ^ K_puf;
+assign N_locked = N_prog ^ key_diff[7:0];
+
+endmodule
+
+// ===================== Divider =====================
+module divider_8bit (
+    input clk,
+    input rst_n,
+    input [7:0] N_locked,
+    output reg f_div
+);
+
+reg [7:0] count;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        count <= 0;
+        f_div <= 0;
+    end else begin
+        if (count == N_locked) begin
+            count <= 0;
+            f_div <= ~f_div;
+        end else begin
+            count <= count + 1;
+        end
+    end
+end
+
+endmodule
+
+// ===================== PFD =====================
+module pfd (
+    input clk_ref,
+    input clk_fb,
+    input rst_n,
+    output reg UP,
+    output reg DN
+);
+
+always @(posedge clk_ref or negedge rst_n)
+    if (!rst_n) UP <= 0;
+    else UP <= 1;
+
+always @(posedge clk_fb or negedge rst_n)
+    if (!rst_n) DN <= 0;
+    else DN <= 1;
+
+always @(UP or DN)
+    if (UP && DN) begin
+        UP = 0;
+        DN = 0;
+    end
+
+endmodule
+
+// ===================== TESTBENCH =====================
+module tb_mixlock_pll_top;
+
+reg clk = 0;
+always #5 clk = ~clk;
+
+reg rst_n = 0;
+reg scan_enable = 0;
+reg chip_reset = 0;
+reg [7:0] N_prog = 8'd10;
+reg f_ref = 0;
+always #10 f_ref = ~f_ref;
+
+wire f_out, lock_detect, corrupt_flag, puf_ready;
+
+mixlock_pll_top uut (
+    .clk(clk),
+    .rst_n(rst_n),
+    .chip_reset(chip_reset),
+    .scan_enable(scan_enable),
+    .N_prog(N_prog),
+    .f_ref(f_ref),
+    .f_out(f_out),
+    .lock_detect(lock_detect),
+    .corrupt_flag(corrupt_flag),
+    .puf_ready(puf_ready)
+);
+
+initial begin
+    $dumpfile("mixlock.vcd");
+    $dumpvars(0, tb_mixlock_pll_top);
+
+    #10 rst_n = 1;
+
+    // Normal operation
+    #100;
+
+    // Attack
+    scan_enable = 1;
+    #20 scan_enable = 0;
+
+    // Recovery
+    #50 chip_reset = 1;
+    #10 chip_reset = 0;
+
+    #200 $finish;
+end
+
+endmodule
